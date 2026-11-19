@@ -11,6 +11,10 @@ Topology (xray -confdir, like the JSON pool mode):
                  loopback SOCKS "probe" inbound whose user name selects the node
                  to test, so health checks take exactly the path real traffic does.
   99-overlay.json the proxy-unifi WireGuard inbound (mkjson.build_overlay).
+  self-hosts.txt "host port" per line: loopback dokodemo-door inbounds self-N
+                 that carry the router's own HTTPS to geo-blocked hosts
+                 (Ubiquiti updates) through the balancer; `proxy _self-route`
+                 points the hosts there with /etc/hosts + an OUTPUT redirect.
   nodes.json     tag -> node facts and priority, read by picker.py and the panel.
 
 The picker (picker.py) chooses the active node with `xray api bo`; until it
@@ -26,7 +30,7 @@ Inputs are files under the proxy-unifi data root:
 Subcommands:
   build   --root R --out-dir O --geo-dir G --listen --port --address --mtu
           --keepalive --loglevel --secret-key-file --peer-pubkey-file
-          --api-port N --probe-port N --probe-pass-file F
+          --api-port N --probe-port N --probe-pass-file F [--self-port N]
   rule    --value V                -> normalized entry or error (exit 1)
   settings --root R [--set k=v ...] -> print effective settings JSON
   nodes   --root R                 -> every node with usability + reason (JSON)
@@ -56,7 +60,11 @@ DEFAULTS = {
     "disabled": [],            # node ids never used
     "pinned": [],              # node ids preferred first inside their country
     "country": {},             # node id -> country code override
+    # The router's own HTTPS to these hosts goes through the VPN (geo-blocked
+    # Ubiquiti firmware/app downloads); see self-hosts.txt and `_self-route`.
+    "self_hosts": ["fw-download.ubnt.com", "apt.artifacts.ui.com"],
 }
+MAX_SELF_HOSTS = 32
 MODES = ("list", "all")
 MAX_RULES = 5000
 MAX_NODES = 256
@@ -145,7 +153,17 @@ def load_settings(root):
     return validate_settings(s)
 
 
+def _valid_hostname(h):
+    if not isinstance(h, str) or not 1 <= len(h) <= 253 or "." not in h:
+        return False
+    return all(_LABEL_RE.match(x) for x in h.split("."))
+
+
 def validate_settings(s):
+    if not isinstance(s["self_hosts"], list) or len(s["self_hosts"]) > MAX_SELF_HOSTS \
+            or not all(_valid_hostname(h) for h in s["self_hosts"]) \
+            or len(set(s["self_hosts"])) != len(s["self_hosts"]):
+        die("self_hosts must be a list of distinct host names (at most %d)" % MAX_SELF_HOSTS)
     if s["mode"] not in MODES:
         die("mode must be one of: %s" % ", ".join(MODES))
     if not isinstance(s["order"], list) or len(s["order"]) > 64 \
@@ -173,6 +191,14 @@ def apply_setting(s, key, value):
         s[key] = value
     elif key == "order":
         s[key] = [c.strip().upper() for c in value.split(",") if c.strip()]
+    elif key == "self_hosts":
+        if value.lstrip().startswith("["):
+            try:
+                s[key] = json.loads(value)
+            except ValueError:
+                die("self_hosts takes a comma list or JSON")
+        else:
+            s[key] = [h.strip().lower() for h in value.split(",") if h.strip()]
     elif key == "ru_blocked":
         if value not in ("on", "off", "true", "false", "1", "0"):
             die("ru_blocked takes on/off")
@@ -358,6 +384,9 @@ def build_config(args, settings, nodes, probe_pass):
     for t in tags:
         rules.append({"type": "field", "inboundTag": ["probe-in"], "user": [t], "outboundTag": t})
     rules.append({"type": "field", "inboundTag": ["probe-in"], "outboundTag": "block"})
+    self_tags = ["self-%d" % i for i in range(len(settings["self_hosts"]))]
+    if self_tags:
+        rules.append({"type": "field", "inboundTag": self_tags, "balancerTag": "vpn"})
     rules.append({"type": "field", "inboundTag": ["wg-in"], "ip": PRIVATE_NETS,
                   "outboundTag": "direct"})
     d_dom, d_ip = _rule_fields(direct_rules)
@@ -397,6 +426,13 @@ def build_config(args, settings, nodes, probe_pass):
              "protocol": "socks",
              "settings": {"auth": "password", "udp": False,
                           "accounts": [{"user": t, "pass": probe_pass} for t in tags]}},
+        ] + [
+            # TLS passes through untouched: the router's client still sees the
+            # real certificate of the real host.
+            {"tag": "self-%d" % i, "listen": "127.0.0.1", "port": args.self_port + i,
+             "protocol": "dokodemo-door",
+             "settings": {"address": h, "port": 443, "network": "tcp"}}
+            for i, h in enumerate(settings["self_hosts"])
         ],
         "outbounds": outbounds,
         "routing": {
@@ -410,10 +446,13 @@ def build_config(args, settings, nodes, probe_pass):
 def cmd_build(args):
     valid_host(args.listen)
     safe_port(args.port)
-    for p in (args.api_port, args.probe_port):
+    for p in (args.api_port, args.probe_port, args.self_port,
+              args.self_port + MAX_SELF_HOSTS - 1):
         safe_port(p)
-    if len({args.port, args.api_port, args.probe_port}) != 3:
-        die("WireGuard, API and probe ports must differ")
+    self_range = set(range(args.self_port, args.self_port + MAX_SELF_HOSTS))
+    if len({args.port, args.api_port, args.probe_port}) != 3 \
+            or self_range & {args.port, args.api_port, args.probe_port}:
+        die("WireGuard, API, probe and self-route ports must differ")
     if not 576 <= args.mtu <= 9000:
         die("WireGuard MTU is out of range")
     if args.loglevel not in ("debug", "info", "warning", "error", "none"):
@@ -435,6 +474,9 @@ def cmd_build(args):
             json.dump(cfg, fh, ensure_ascii=False)
         with open(os.path.join(args.out_dir, "99-overlay.json"), "w", encoding="utf-8") as fh:
             json.dump(overlay, fh, ensure_ascii=False)
+        with open(os.path.join(args.out_dir, "self-hosts.txt"), "w", encoding="utf-8") as fh:
+            for i, h in enumerate(settings["self_hosts"]):
+                fh.write("%s %d\n" % (h, args.self_port + i))
         with open(os.path.join(args.out_dir, "nodes.json"), "w", encoding="utf-8") as fh:
             json.dump({"order": settings["order"], "mode": settings["mode"],
                        "nodes": public_nodes(nodes)}, fh, ensure_ascii=False)
@@ -485,6 +527,7 @@ def main():
     b.add_argument("--peer-pubkey-file", required=True)
     b.add_argument("--api-port", type=int, default=51822)
     b.add_argument("--probe-port", type=int, default=51823)
+    b.add_argument("--self-port", type=int, default=51830)
     b.add_argument("--probe-pass-file", required=True)
     b.set_defaults(fn=cmd_build)
     r = sub.add_parser("rule")

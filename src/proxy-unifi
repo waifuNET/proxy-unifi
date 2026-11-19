@@ -112,6 +112,7 @@ PING_TIMEOUT="5"
 SUB_REFRESH_HOURS="6"
 AUTO_API_PORT="51822"
 AUTO_PROBE_PORT="51823"
+AUTO_SELF_PORT="51830"
 PANEL_LISTEN="auto"
 PANEL_PORT="5200"
 SUB_USER_AGENT_DEFAULT="Happ/2.0"
@@ -165,6 +166,8 @@ load_settings() {
                 if _uint "$_value" && [ "$_value" -ge 1024 ] && [ "$_value" -le 65535 ]; then AUTO_API_PORT="$_value"; fi ;;
             AUTO_PROBE_PORT)
                 if _uint "$_value" && [ "$_value" -ge 1024 ] && [ "$_value" -le 65535 ]; then AUTO_PROBE_PORT="$_value"; fi ;;
+            AUTO_SELF_PORT)
+                if _uint "$_value" && [ "$_value" -ge 1024 ] && [ "$_value" -le 65500 ]; then AUTO_SELF_PORT="$_value"; fi ;;
             PANEL_PORT)
                 if _uint "$_value" && [ "$_value" -ge 1024 ] && [ "$_value" -le 65535 ]; then PANEL_PORT="$_value"; fi ;;
             PANEL_LISTEN) case "$_value" in auto) PANEL_LISTEN=auto ;; ""|*[!0-9.]*) : ;; *) PANEL_LISTEN="$_value" ;; esac ;;
@@ -243,6 +246,7 @@ SUB_USER_AGENT="$SUB_USER_AGENT"
 AUTO_UPDATE="$AUTO_UPDATE"
 AUTO_API_PORT="$AUTO_API_PORT"
 AUTO_PROBE_PORT="$AUTO_PROBE_PORT"
+AUTO_SELF_PORT="$AUTO_SELF_PORT"
 PANEL_LISTEN="$PANEL_LISTEN"
 PANEL_PORT="$PANEL_PORT"
 EOF
@@ -1253,7 +1257,12 @@ write_service() {
             _exec="$SBIN run -c $CONFIG"; _cond="$CONFIG"
             _fwpre="ExecStartPre=+$BIN_DIR/proxy-unifi _fw-lock"
             _fwpost="ExecStopPost=-+$BIN_DIR/proxy-unifi _fw-unlock" ;;
-        xraypool|xrayauto)
+        xrayauto)
+            _exec="$XRAY run -confdir $POOL_DIR"; _cond="$POOL_DIR/99-overlay.json"
+            _fwpre="ExecStartPre=-+$BIN_DIR/proxy-unifi _fw-unlock"
+            _fwpost="ExecStartPost=-+$BIN_DIR/proxy-unifi _self-route-on
+ExecStopPost=-+$BIN_DIR/proxy-unifi _self-route-off" ;;
+        xraypool)
             _exec="$XRAY run -confdir $POOL_DIR"; _cond="$POOL_DIR/99-overlay.json"
             _fwpre="ExecStartPre=-+$BIN_DIR/proxy-unifi _fw-unlock"; _fwpost="" ;;
         *)
@@ -1377,6 +1386,88 @@ fw_reconcile() {
         fw_lock
     else
         fw_unlock
+    fi
+    self_route_reconcile
+}
+
+# --------------------------------------------------------------------------
+# Self-route: the router's own HTTPS to geo-blocked hosts (Ubiquiti firmware
+# and app downloads answer 451 in some countries) goes through the Auto VPN.
+# /etc/hosts points each host at 127.0.77.N and an OUTPUT redirect sends
+# 127.0.77.N:443 to xray's loopback dokodemo-door inbound self-N, which
+# forwards the untouched TLS stream to the real host via the active node.
+# The guard timer re-asserts it every 30 s (UniFi OS rewrites /etc/hosts and
+# wipes it on upgrades); without a running Auto core everything is removed,
+# so the router falls back to its direct path.
+# --------------------------------------------------------------------------
+SELF_CHAIN="PROXY_UNIFI_SELF"
+SELF_HOSTS_FILE="$POOL_DIR/self-hosts.txt"
+SELF_MARK_BEGIN="# proxy-unifi self-route begin"
+SELF_MARK_END="# proxy-unifi self-route end"
+HOSTS_FILE="/etc/hosts"
+
+_self_hosts_without_block() {
+    awk -v b="$SELF_MARK_BEGIN" -v e="$SELF_MARK_END" \
+        '$0==b{skip=1;next} $0==e{skip=0;next} !skip' "$HOSTS_FILE"
+}
+
+_self_write_hosts() {   # stdin: block body ("" = remove the block)
+    _body="$(cat)"
+    _new="$(_self_hosts_without_block)" || return 1
+    if [ -n "$_body" ]; then
+        _new="$(printf '%s\n%s\n%s\n%s' "$_new" "$SELF_MARK_BEGIN" "$_body" "$SELF_MARK_END")"
+    fi
+    [ "$(cat "$HOSTS_FILE")" = "$_new" ] && return 0
+    # In place: /etc/hosts may be a bind mount or watched by inode.
+    printf '%s\n' "$_new" > "$HOSTS_FILE"
+}
+
+self_route_off() {
+    if grep -qxF "$SELF_MARK_BEGIN" "$HOSTS_FILE" 2>/dev/null; then  # set -e safe: in if
+        printf '' | _self_write_hosts || true
+    fi
+    have iptables || return 0
+    while iptables -t nat -C OUTPUT -j "$SELF_CHAIN" 2>/dev/null; do
+        iptables -t nat -D OUTPUT -j "$SELF_CHAIN" 2>/dev/null || break
+    done
+    iptables -t nat -F "$SELF_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$SELF_CHAIN" 2>/dev/null || true
+}
+
+self_route_on() {
+    [ -s "$SELF_HOSTS_FILE" ] || { self_route_off; return 0; }
+    have iptables || { err "iptables is required for the self-route"; return 1; }
+    _body=""; _want=""; _n=0
+    while read -r _h _p; do
+        case "$_h" in ""|*[!a-z0-9.-]*) continue ;; esac
+        _uint "$_p" || continue
+        _n=$((_n + 1)); [ "$_n" -le 250 ] || break
+        _body="${_body}127.0.77.$_n	$_h
+"
+        _want="${_want}-A $SELF_CHAIN -d 127.0.77.$_n/32 -p tcp -m tcp --dport 443 -j REDIRECT --to-ports $_p
+"
+    done < "$SELF_HOSTS_FILE"
+    iptables -t nat -N "$SELF_CHAIN" 2>/dev/null || true
+    _have="$(iptables -t nat -S "$SELF_CHAIN" 2>/dev/null | grep "^-A " || true)"
+    if [ "$_have" != "$(printf '%s' "$_want" | sed '/^$/d')" ]; then
+        iptables -t nat -F "$SELF_CHAIN" || return 1
+        printf '%s' "$_want" | while read -r _rule; do
+            [ -n "$_rule" ] || continue
+            # shellcheck disable=SC2086 # one rule as separate words
+            iptables -t nat $_rule || exit 1
+        done || return 1
+    fi
+    iptables -t nat -C OUTPUT -j "$SELF_CHAIN" 2>/dev/null \
+        || iptables -t nat -I OUTPUT 1 -j "$SELF_CHAIN" || return 1
+    printf '%s' "$_body" | sed '/^$/d' | _self_write_hosts
+}
+
+self_route_reconcile() {
+    if [ "$(current_engine)" = "xrayauto" ] \
+            && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        self_route_on
+    else
+        self_route_off
     fi
 }
 
@@ -3233,7 +3324,7 @@ _build_auto() {
         --keepalive "$WG_KEEPALIVE" --loglevel "$LOGLEVEL" \
         --secret-key-file "$WG_DIR/wg_private.key" --peer-pubkey-file "$WG_DIR/unifi_public.key" \
         --api-port "$AUTO_API_PORT" --probe-port "$AUTO_PROBE_PORT" \
-        --probe-pass-file "$AUTO_PROBE_PASS" 2>"$_stage/.err")" \
+        --self-port "$AUTO_SELF_PORT" --probe-pass-file "$AUTO_PROBE_PASS" 2>"$_stage/.err")" \
         || { _ab_msg="$(head -n 1 "$_stage/.err")"; rm -rf "$_stage"; fatal "Auto config: ${_ab_msg#*error: }"; }
     rm -f "$_stage/.err"
     chown root:"$SERVICE_GROUP" "$_stage"/*.json; chmod 640 "$_stage"/*.json
@@ -3448,7 +3539,7 @@ auto_rule() {
 
 # proxy auto set mode list|all | order DE,PL,.. | ru_blocked on|off
 auto_set() {
-    case "${1:-}" in mode|order|ru_blocked) : ;; *) fatal "use: set mode|order|ru_blocked <value>" ;; esac
+    case "${1:-}" in mode|order|ru_blocked|self_hosts) : ;; *) fatal "use: set mode|order|ru_blocked|self_hosts <value>" ;; esac
     auto_ensure_dirs
     ensure_run_dir
     _new="$(py "$MKAUTO" settings --root "$AUTO_DIR" --set "$1=${2:-}" 2>&1)" || fatal "${_new#*error: }"
@@ -3754,7 +3845,7 @@ menu_auto() {
 cmd="${1:-}"
 if [ $# -ge 1 ]; then shift; fi
 case "$cmd" in
-    ""|_fw-lock|_fw-unlock) : ;;
+    ""|_fw-lock|_fw-unlock|_self-route-on|_self-route-off) : ;;
     # An automatic update leaves the lock to the installer.
     _auto-update) need_root ;;
     # The guard timer's 30 s runs skip a held lock: that operation restarts what it changes.
@@ -3785,4 +3876,6 @@ case "$cmd" in
     auto)         cmd_auto "$@" ;;
     _fw-lock)        fw_lock ;;
     _fw-unlock)      fw_unlock ;;
+    _self-route-on)  self_route_on ;;
+    _self-route-off) self_route_off ;;
 esac

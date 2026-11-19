@@ -81,6 +81,31 @@ class Rules(unittest.TestCase):
         self.assertIsNotNone(refused(mkauto.apply_setting, dict(s), "disabled", '["zz"]'))
 
 
+class SelfRoute(unittest.TestCase):
+    def test_setting(self):
+        s = mkauto.validate_settings(dict(mkauto.DEFAULTS))
+        self.assertIn("fw-download.ubnt.com", s["self_hosts"])
+        self.assertEqual(mkauto.apply_setting(dict(s), "self_hosts", "A.ui.com, b.ui.com")["self_hosts"],
+                         ["a.ui.com", "b.ui.com"])
+        self.assertIsNotNone(refused(mkauto.apply_setting, dict(s), "self_hosts", "bad host"))
+        self.assertIsNotNone(refused(mkauto.apply_setting, dict(s), "self_hosts", "a.com,a.com"))
+
+    def test_inbounds_go_through_the_balancer(self):
+        import argparse
+        args = argparse.Namespace(root="/nonexistent", geo_dir="/nonexistent",
+                                  api_port=51822, probe_port=51823, self_port=51830)
+        settings = dict(mkauto.DEFAULTS, mode="list", ru_blocked=False)
+        node = {"usable": True, "tag": "n-1",
+                "_outbound": {"tag": "n-1", "protocol": "freedom", "settings": {}}}
+        cfg = mkauto.build_config(args, settings, [node], "x" * 16)
+        selfs = [i for i in cfg["inbounds"] if i["tag"].startswith("self-")]
+        self.assertEqual([(i["port"], i["settings"]["address"]) for i in selfs],
+                         [(51830, "fw-download.ubnt.com"), (51831, "apt.artifacts.ui.com")])
+        self.assertTrue(all(i["listen"] == "127.0.0.1" for i in selfs))
+        rule = [r for r in cfg["routing"]["rules"] if "self-0" in r.get("inboundTag", [])]
+        self.assertEqual(rule[0].get("balancerTag"), "vpn")
+
+
 class Hysteria2Xray(unittest.TestCase):
     def test_outbound(self):
         ob, why = mkauto.outbound_for_link(

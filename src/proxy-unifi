@@ -3605,6 +3605,23 @@ auto_geo_fetch() {
         { chmod 644 "$RUN_DIR/$_dst" && mv -f "$RUN_DIR/$_dst" "$BIN_DIR/$_dst.new" \
             && mv -f "$BIN_DIR/$_dst.new" "$BIN_DIR/$_dst"; } || { err "could not install $_dst"; return 1; }
     done
+    printf '%s\n' "$_tag" > "$BIN_DIR/ru-geo.tag" 2>/dev/null || true
+}
+
+# Timer path (every SUB_REFRESH_HOURS): fetch the lists only when runetfreedom
+# published a new release, then restart the core so the rules take effect.
+# Never fatal: a failed check just waits for the next run.
+auto_geo_refresh() {
+    [ "$(current_engine)" = "xrayauto" ] || return 0
+    _tag="$(resolve_latest_tag "https://github.com/$RU_GEO_REPO/releases" 2>/dev/null)" || return 0
+    [ -n "$_tag" ] || return 0
+    [ "$(cat "$BIN_DIR/ru-geo.tag" 2>/dev/null)" = "$_tag" ] && return 0
+    auto_geo_fetch || { err "ru-blocked lists: update to $_tag failed"; return 0; }
+    if auto_is_active; then
+        restart_service || err "service failed its health check after the list update"
+        systemctl restart "$PICKER_NAME" >/dev/null 2>&1 || true
+    fi
+    info "ru-blocked lists updated to $_tag"
 }
 
 auto_geo_update() {
@@ -3872,7 +3889,8 @@ case "$cmd" in
     _fw-reconcile)   fw_reconcile ;;
     sub-refresh-auto)
         if [ -s "$SUB_URL_FILE" ]; then _AUTO_REFRESH=1 sub_refresh || true; fi
-        if [ -n "$(ls "$AUTO_SRC_DIR"/*.url 2>/dev/null)" ]; then _AUTO_REFRESH=1 auto_refresh; fi ;;
+        if [ -n "$(ls "$AUTO_SRC_DIR"/*.url 2>/dev/null)" ]; then _AUTO_REFRESH=1 auto_refresh; fi
+        auto_geo_refresh ;;
     auto)         cmd_auto "$@" ;;
     _fw-lock)        fw_lock ;;
     _fw-unlock)      fw_unlock ;;

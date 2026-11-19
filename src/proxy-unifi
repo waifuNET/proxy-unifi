@@ -3620,6 +3620,10 @@ auto_panel_password() {
 }
 
 write_auto_units() {
+    # ReadWritePaths needs the directory before systemd sets up the namespace.
+    ensure_service_user
+    mkdir -p "$AUTO_STATE_DIR" && chown "$SERVICE_USER:$SERVICE_GROUP" "$AUTO_STATE_DIR" \
+        && chmod 750 "$AUTO_STATE_DIR" || return 1
     atomic_write "$PICKER_SERVICE_FILE" 644 <<EOF || return 1
 [Unit]
 Description=proxy-unifi Auto mode failover picker
@@ -3632,7 +3636,6 @@ Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_GROUP
 UMask=0027
-ExecStartPre=+/bin/sh -c 'mkdir -p $AUTO_STATE_DIR && chown $SERVICE_USER:$SERVICE_GROUP $AUTO_STATE_DIR && chmod 750 $AUTO_STATE_DIR'
 ExecStart=/usr/bin/env python3 $PICKER --nodes-file $POOL_DIR/nodes.json --probe-pass-file $AUTO_PROBE_PASS --state-dir $AUTO_STATE_DIR --xray $XRAY --api-port $AUTO_API_PORT --probe-port $AUTO_PROBE_PORT --url $PING_URL
 Restart=always
 RestartSec=3

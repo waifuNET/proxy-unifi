@@ -57,12 +57,12 @@ static_tests() {
     if have shellcheck; then
         _sc_log="$(mktemp)"
         shellcheck -s sh "$SRC/proxy-unifi" "$SRC/on_boot.sh" "$ROOT/install.sh" \
-            "$ROOT/tests/run.sh" "$ROOT/tests/lifecycle.sh" > "$_sc_log" 2>&1 &
+            "$ROOT/tests/run.sh" "$ROOT/tests/lifecycle.sh" "$ROOT/tests/auto.sh" > "$_sc_log" 2>&1 &
         _sc_pid=$!
     else printf '  skip shellcheck (not installed)\n'; fi
     if have dash; then
         _d=0
-        for f in "$SRC/proxy-unifi" "$SRC/on_boot.sh" "$ROOT/install.sh" "$ROOT/tests/lifecycle.sh"; do
+        for f in "$SRC/proxy-unifi" "$SRC/on_boot.sh" "$ROOT/install.sh" "$ROOT/tests/lifecycle.sh" "$ROOT/tests/auto.sh"; do
             dash -n "$f" 2>/dev/null || _d=1
         done
         if [ "$_d" = 0 ]; then ok "dash -n"; else bad "dash -n"; fi
@@ -86,7 +86,7 @@ PY
         then ok "systemd verifies unifi-common boot unit"; else bad "systemd verifies unifi-common boot unit"; fi
     fi
     rm -rf "$_ud"
-    if python3 -m py_compile "$SRC"/mkxray.py "$SRC"/mksingbox.py "$SRC"/mksub.py "$SRC"/mkawg.py "$SRC"/mkjson.py "$SRC"/proxylib.py "$SRC"/safeexec.py 2>/dev/null
+    if python3 -m py_compile "$SRC"/mkxray.py "$SRC"/mksingbox.py "$SRC"/mksub.py "$SRC"/mkawg.py "$SRC"/mkjson.py "$SRC"/mkauto.py "$SRC"/picker.py "$SRC"/panel.py "$SRC"/proxylib.py "$SRC"/safeexec.py 2>/dev/null
     then ok "python compile"; else bad "python compile"; fi
     rm -rf "$SRC/__pycache__"
     if grep -Fq "sys.version_info < (3, 9)" "$ROOT/install.sh" \
@@ -338,8 +338,8 @@ SH
     # assets from one retained promotion backup.
     _id="$(mktemp -d)"
     mkdir -p "$_id/live" "$_id/backup"
-    for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py \
-              xray sing-box amnezia-box geoip.dat geosite.dat; do
+    for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkauto.py picker.py panel.py proxylib.py safeexec.py \
+              xray sing-box amnezia-box geoip.dat geosite.dat ru-geoip.dat ru-geosite.dat; do
         printf old > "$_id/backup/$_f"; printf new > "$_id/live/$_f"
     done
     printf old > "$_id/backup/on_boot.sh"; printf new > "$_id/on_boot.sh"; : > "$_id/marker"
@@ -398,7 +398,7 @@ SH
 
     _bd="$(mktemp -d)"
     mkdir -p "$_bd/archive-root/src" "$_bd/work"
-    for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py on_boot.sh; do
+    for _f in proxy-unifi mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkauto.py picker.py panel.py proxylib.py safeexec.py on_boot.sh; do
         printf 'bundle:%s\n' "$_f" > "$_bd/archive-root/src/$_f"
     done
     python3 - "$_bd/source.tgz" "$_bd/archive-root" <<'PY'
@@ -635,6 +635,8 @@ PY
 
 parser_tests() {
     echo "== parsers =="
+    if _auto_test="$(python3 "$ROOT/tests/test_auto.py" 2>&1)"; then ok "Auto mode: fm, countries, rules, hysteria2 for xray, picker choices"
+    else bad "Auto mode: fm, countries, rules, hysteria2 for xray, picker choices"; printf '%s\n' "$_auto_test" | tail -n 20; fi
     if _options_test="$(python3 "$ROOT/tests/test_share_link_options.py" 2>&1)"; then
         ok "share-link options map to what the cores support"
     else
@@ -2060,6 +2062,11 @@ print(json.dumps(c))' "http://127.0.0.1:$_wp/slow" > "$_d/race-core.json"
     elif sh -x "$ROOT/tests/lifecycle.sh" "$XR" >"$_d.lifecycle" 2>&1; then ok "sandboxed CLI lifecycle + rollback"
     else bad "sandboxed CLI lifecycle + rollback"; tail -n 20 "$_d.lifecycle"; fi
     rm -f "$_d.lifecycle"
+    if [ "${PROXY_UNIFI_QUICK:-}" = 1 ]; then
+        printf '  skip sandboxed Auto lifecycle (deferred: PROXY_UNIFI_QUICK=1)\n'
+    elif sh -x "$ROOT/tests/auto.sh" "$XR" "$CACHE" >"$_d.auto" 2>&1; then ok "sandboxed Auto mode lifecycle + rollback"
+    else bad "sandboxed Auto mode lifecycle + rollback"; tail -n 20 "$_d.auto"; fi
+    rm -f "$_d.auto"
 }
 
 # -------------------------------------------------------------------------

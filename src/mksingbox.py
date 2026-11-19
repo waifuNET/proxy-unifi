@@ -42,6 +42,33 @@ def _bool_value(value, label):
     die("%s must be true/false or 1/0" % label)
 
 
+_FM_CONGESTION = {"bbr", "cubic", "reno", "brutal", ""}
+
+
+def check_finalmask(value):
+    """Happ's 'fm' (finalmask) option on hysteria2 links. Accept only the
+    harmless QUIC tuning shape providers ship ({"quicParams": {"congestion":
+    "bbr", "debug": false}}) and ignore it: the cores choose congestion control
+    themselves. Anything else would change the wire format, so it is refused."""
+    if value in (None, ""):
+        return
+    if len(value) > 512:
+        die("hysteria2 'fm' option is too long")
+    try:
+        fm = json.loads(value)
+    except ValueError:
+        die("hysteria2 'fm' option is not valid JSON")
+    if not isinstance(fm, dict) or set(fm) - {"quicParams"}:
+        die("hysteria2 'fm' option is not supported")
+    qp = fm.get("quicParams", {})
+    if not isinstance(qp, dict) or set(qp) - {"congestion", "debug"}:
+        die("hysteria2 'fm' quicParams are not supported")
+    if qp.get("congestion", "") not in _FM_CONGESTION:
+        die("hysteria2 'fm' congestion is not supported")
+    if not isinstance(qp.get("debug", False), bool):
+        die("hysteria2 'fm' debug must be true/false")
+
+
 def _tls(sni, q, default_alpn=None):
     tls = {"enabled": True, "server_name": sni}
     alpn = qg(q, "alpn")
@@ -135,8 +162,9 @@ def parse_hysteria2(link):
         auth = auth + ":" + unquote(u.password) if auth else unquote(u.password)
     reject_unknown_query(q, _TLS_QUERY | _TFO_QUERY | {
         "obfs", "obfs-password", "obfs_password", "pinSHA256", "pinsha256",
-        "mport", "ports", "hop-interval", "hop_interval", "upmbps", "downmbps"})
+        "mport", "ports", "hop-interval", "hop_interval", "upmbps", "downmbps", "fm"})
     _bool_value(qg(q, "tfo", "fastopen"), "TCP Fast Open option")
+    check_finalmask(qg(q, "fm"))
     sni = qg(q, "sni", "peer") or host
     tls = _tls(sni, q, default_alpn=["h3"])
     # pinSHA256 is a hex *certificate* fingerprint; sing-box only offers a base64

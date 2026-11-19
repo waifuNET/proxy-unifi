@@ -25,7 +25,7 @@ CONFIG="$ETC_DIR/config.json"
 OUTBOUND_LINK="$ETC_DIR/link.txt"
 POOL_DIR="$ETC_DIR/pool"                    # xray -confdir dir for a JSON balancer profile
 POOL_SRC="$ETC_DIR/pool.json"               # the imported provider profile (verbatim source)
-ENGINE_FILE="$ETC_DIR/engine"               # active engine: xray / singbox / xraypool / awg
+ENGINE_FILE="$ETC_DIR/engine"               # active engine: xray / singbox / xraypool / xrayauto / awg
 SERVER_CACHE="$ETC_DIR/.server"             # cached "Server:" display string (menu speed)
 MKJSON="$BIN_DIR/mkjson.py"
 AUTOSTART_FILE="$ETC_DIR/autostart"         # "enabled" / "disabled" (persisted across boots)
@@ -65,6 +65,21 @@ AU_MIN_AGE=86400                            # automatic updates take versions wh
 AU_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}-autoupdate.service"
 AU_TIMER_FILE="/etc/systemd/system/${SERVICE_NAME}-autoupdate.timer"
 TXN_ROOT="$ROOT/.transactions"
+# Auto mode (failover pool across sources, rules, LAN panel)
+AUTO_DIR="$ETC_DIR/auto"
+AUTO_SRC_DIR="$AUTO_DIR/sources"
+AUTO_RULES_DIR="$AUTO_DIR/rules"
+AUTO_PROBE_PASS="$AUTO_DIR/probe.pass"
+AUTO_STATE_DIR="$ROOT/state"                # picker status + switch log (service-writable)
+MKAUTO="$BIN_DIR/mkauto.py"
+PICKER="$BIN_DIR/picker.py"
+PANEL="$BIN_DIR/panel.py"
+PICKER_NAME="${SERVICE_NAME}-picker"
+PANEL_NAME="${SERVICE_NAME}-panel"
+PICKER_SERVICE_FILE="/etc/systemd/system/${PICKER_NAME}.service"
+PANEL_SERVICE_FILE="/etc/systemd/system/${PANEL_NAME}.service"
+PANEL_PASS_FILE="$ETC_DIR/panel.pass"
+RU_GEO_REPO="runetfreedom/russia-v2ray-rules-dat"
 TXN_MARKER="$TXN_ROOT/active"
 
 
@@ -95,6 +110,10 @@ PING_MODE="get"
 PING_URL="https://www.gstatic.com/generate_204"
 PING_TIMEOUT="5"
 SUB_REFRESH_HOURS="6"
+AUTO_API_PORT="51822"
+AUTO_PROBE_PORT="51823"
+PANEL_LISTEN="auto"
+PANEL_PORT="5200"
 SUB_USER_AGENT_DEFAULT="Happ/2.0"
 SUB_USER_AGENT_LEGACY_DEFAULT="proxy-unifi/1.1"
 SUB_USER_AGENT="$SUB_USER_AGENT_DEFAULT"
@@ -142,6 +161,13 @@ load_settings() {
                 if _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 60 ]; then PING_TIMEOUT="$_value"; fi ;;
             SUB_REFRESH_HOURS)
                 if _uint "$_value" && [ "$_value" -ge 1 ] && [ "$_value" -le 8760 ]; then SUB_REFRESH_HOURS="$_value"; fi ;;
+            AUTO_API_PORT)
+                if _uint "$_value" && [ "$_value" -ge 1024 ] && [ "$_value" -le 65535 ]; then AUTO_API_PORT="$_value"; fi ;;
+            AUTO_PROBE_PORT)
+                if _uint "$_value" && [ "$_value" -ge 1024 ] && [ "$_value" -le 65535 ]; then AUTO_PROBE_PORT="$_value"; fi ;;
+            PANEL_PORT)
+                if _uint "$_value" && [ "$_value" -ge 1024 ] && [ "$_value" -le 65535 ]; then PANEL_PORT="$_value"; fi ;;
+            PANEL_LISTEN) case "$_value" in auto) PANEL_LISTEN=auto ;; ""|*[!0-9.]*) : ;; *) PANEL_LISTEN="$_value" ;; esac ;;
             SUB_USER_AGENT)
                 case "$_value" in
                     "$SUB_USER_AGENT_LEGACY_DEFAULT")
@@ -215,6 +241,10 @@ PING_TIMEOUT="$PING_TIMEOUT"
 SUB_REFRESH_HOURS="$SUB_REFRESH_HOURS"
 SUB_USER_AGENT="$SUB_USER_AGENT"
 AUTO_UPDATE="$AUTO_UPDATE"
+AUTO_API_PORT="$AUTO_API_PORT"
+AUTO_PROBE_PORT="$AUTO_PROBE_PORT"
+PANEL_LISTEN="$PANEL_LISTEN"
+PANEL_PORT="$PANEL_PORT"
 EOF
 }
 
@@ -684,10 +714,11 @@ current_engine() {
     # wrong core, e.g. running a hysteria2 link under xray).
     _ce="$(cat "$ENGINE_FILE" 2>/dev/null || true)"
     case "$_ce" in
-        xray|singbox|xraypool|awg) echo "$_ce"; return ;;
+        xray|singbox|xraypool|xrayauto|awg) echo "$_ce"; return ;;
     esac
     if [ -s "$AWG_SELECTED" ] && awg_selected_profile >/dev/null 2>&1; then echo awg; return; fi
-    # a pool dir present means we're in pool mode
+    # a pool dir present means we're in pool (or Auto) mode
+    if [ -f "$POOL_DIR/01-auto.json" ]; then echo xrayauto; return; fi
     if [ -f "$POOL_DIR/99-overlay.json" ]; then echo xraypool; return; fi
     if [ -f "$OUTBOUND_LINK" ]; then
         _ce="$(engine_for_link_file "$OUTBOUND_LINK")"
@@ -1222,7 +1253,7 @@ write_service() {
             _exec="$SBIN run -c $CONFIG"; _cond="$CONFIG"
             _fwpre="ExecStartPre=+$BIN_DIR/proxy-unifi _fw-lock"
             _fwpost="ExecStopPost=-+$BIN_DIR/proxy-unifi _fw-unlock" ;;
-        xraypool)
+        xraypool|xrayauto)
             _exec="$XRAY run -confdir $POOL_DIR"; _cond="$POOL_DIR/99-overlay.json"
             _fwpre="ExecStartPre=-+$BIN_DIR/proxy-unifi _fw-unlock"; _fwpost="" ;;
         *)
@@ -1284,6 +1315,10 @@ TimeoutStopSec=15
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload 2>/dev/null || { err "systemd daemon-reload failed"; return 1; }
+    # The failover picker only belongs to Auto mode.
+    if [ "$(current_engine)" != "xrayauto" ] && [ -f "$PICKER_SERVICE_FILE" ]; then
+        systemctl disable --now "$PICKER_NAME" >/dev/null 2>&1 || true
+    fi
 }
 
 write_refresh_timer() {
@@ -1293,7 +1328,8 @@ write_refresh_timer() {
 Description=Refresh proxy-unifi subscription catalog
 After=network-online.target
 Wants=network-online.target
-ConditionPathExists=$SUB_URL_FILE
+ConditionPathExists=|$SUB_URL_FILE
+ConditionPathExists=|$AUTO_SRC_DIR
 
 [Service]
 Type=oneshot
@@ -1320,7 +1356,7 @@ EOF
 }
 
 enable_refresh_timer() {
-    [ -s "$SUB_URL_FILE" ] || return 0
+    [ -s "$SUB_URL_FILE" ] || [ -n "$(ls "$AUTO_SRC_DIR"/*.url 2>/dev/null)" ] || return 0
     write_refresh_timer || return 1
     systemctl enable --now "${SERVICE_NAME}-refresh.timer" >/dev/null 2>&1
 }
@@ -1354,7 +1390,14 @@ install_service() {
     else
         systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || fatal "could not enable service autostart"
     fi
-    if [ -s "$SUB_URL_FILE" ]; then
+    write_auto_units || fatal "could not write the Auto mode units"
+    if [ "$(current_engine)" = "xrayauto" ]; then
+        systemctl enable "$PICKER_NAME" >/dev/null 2>&1 || fatal "could not enable the failover picker"
+    fi
+    if [ -s "$PANEL_PASS_FILE" ]; then
+        systemctl enable --now "$PANEL_NAME" >/dev/null 2>&1 || c_ylw "warning: the web panel did not start"
+    fi
+    if [ -s "$SUB_URL_FILE" ] || [ -n "$(ls "$AUTO_SRC_DIR"/*.url 2>/dev/null)" ]; then
         enable_refresh_timer || fatal "could not enable subscription refresh timer"
     else
         write_refresh_timer || true
@@ -1534,6 +1577,8 @@ regen_config() {
         _active_awg="$(awg_selected_profile)" \
             || fatal "the selected AmneziaWG profile is missing or invalid"
         _build_awg_profile "$_active_awg"
+    elif [ "$(current_engine)" = "xrayauto" ]; then
+        _build_auto
     elif [ -f "$POOL_SRC" ] && [ "$(current_engine)" = "xraypool" ]; then
         _build_pool "$POOL_SRC"
     else
@@ -1725,6 +1770,7 @@ current_protocol() {
     case "$_cp_engine" in
         awg) printf '%s\n' 'AmneziaWG'; return ;;
         xraypool) printf '%s\n' 'Xray JSON profile'; return ;;
+        xrayauto) printf '%s\n' 'Auto (failover pool)'; return ;;
     esac
     [ -s "$OUTBOUND_LINK" ] || { printf '%s\n' '(none)'; return; }
     _cp_link="$(cat "$OUTBOUND_LINK")"
@@ -1820,7 +1866,7 @@ _save_autostart() { mkdir -p "$ETC_DIR" && printf '%s' "$1" | atomic_write "$AUT
 cmd_config()  {
     # A balancer/pool profile runs from a -confdir, not a single config.json;
     # show the confdir parts so this works in pool mode too.
-    if [ "$(current_engine)" = "xraypool" ] && [ -d "$POOL_DIR" ]; then
+    if { [ "$(current_engine)" = "xraypool" ] || [ "$(current_engine)" = "xrayauto" ]; } && [ -d "$POOL_DIR" ]; then
         for _f in "$POOL_DIR"/*.json; do
             [ -f "$_f" ] || continue
             printf '===== %s =====\n' "$(basename "$_f")"; cat "$_f"; printf '\n'
@@ -2180,6 +2226,12 @@ current_server() {
     printf '%s\n' "$_cs"
 }
 _compute_server() {
+    if [ "$(current_engine)" = "xrayauto" ]; then
+        _as="$(py -c 'import json,sys;print(json.load(open(sys.argv[1])).get("active_label") or "starting")' \
+            "$AUTO_STATE_DIR/status.json" 2>/dev/null)" || _as="starting"
+        printf 'Auto: %s' "$_as"
+        return
+    fi
     # Pool mode has no single server: summarize the balancer instead.
     if [ "$(current_engine)" = "xraypool" ] && [ -f "$POOL_SRC" ]; then
         _pi="$(py "$MKJSON" info --profile "$POOL_SRC" 2>/dev/null)"
@@ -2360,6 +2412,11 @@ cmd_ping() {
     load_settings
     # pool mode keeps its config in $POOL_DIR (no single link file); a plain
     # link keeps $OUTBOUND_LINK. Either is pingable.
+    if [ "$(current_engine)" = "xrayauto" ]; then
+        # Auto probes every server continuously; show what the picker measured.
+        auto_status_text
+        return 0
+    fi
     if [ ! -f "$OUTBOUND_LINK" ] && [ "$(current_engine)" != "xraypool" ] \
         && [ "$(current_engine)" != "awg" ]; then
         c_ylw "No proxy/VPN imported yet. Add a link, subscription, JSON profile, or AmneziaWG profile first."
@@ -2427,6 +2484,8 @@ print_menu() {
     printf '├%s┤\n' "$HR"
     ml " 18. Updates"
     ml " 19. Uninstall"
+    printf '├%s┤\n' "$HR"
+    ml " 20. Auto: failover, rules, sources, panel"
     printf '└%s┘\n' "$HR"
     printf '\n'
     printf 'Service:    %s\n' "$svc_d"
@@ -2502,7 +2561,7 @@ cmd_menu() {
     while true; do
         clear 2>/dev/null || true
         print_menu
-        printf '\nPlease enter your selection [0-19]: '
+        printf '\nPlease enter your selection [0-20]: '
         read -r sel || exit 0
         echo
         # An update from elsewhere (the daily timer) replaced the helpers this
@@ -2537,6 +2596,7 @@ cmd_menu() {
             18) ( menu_updates ) || { [ $? != 10 ] || { c_grn "proxy-unifi was updated: run 'proxy' again."; exit 0; }; } ;;
             19) printf 'Really uninstall the service + boot hook? [y/N]: '; read -r _c || true
                 if [ "${_c:-}" = "y" ]; then ( locked_call cmd_uninstall ); pause; exit 0; else c_ylw "Cancelled."; fi ;;
+            20) ( menu_auto ); continue ;;
             *)  c_red "Invalid selection." ;;
         esac
         pause
@@ -3120,6 +3180,7 @@ cmd_uninstall() {
         && fatal "service is still running; refusing to remove its unit"
     fw_unlock                       # drop the userspace-core firewall guard, if any
     disable_guard_timer
+    remove_auto_units
     systemctl disable --now "$SERVICE_NAME-autoupdate.timer" >/dev/null 2>&1 || true
     rm -f "$SERVICE_FILE" "$REFRESH_SERVICE_FILE" "$REFRESH_TIMER_FILE" "$ONBOOT_DST" \
         "$AU_SERVICE_FILE" "$AU_TIMER_FILE"
@@ -3127,6 +3188,561 @@ cmd_uninstall() {
     systemctl daemon-reload 2>/dev/null || true
     c_ylw "Removed service + boot hook. Data kept at $ROOT (delete it manually to purge keys/config)."
     c_ylw "Don't forget to delete the WireGuard VPN Client in the UniFi UI."
+}
+
+# --------------------------------------------------------------------------
+# Auto mode: every source in one xray, country-priority failover, rule split
+# --------------------------------------------------------------------------
+# Data:   $AUTO_DIR/{auto.json,probe.pass,sources/,rules/}   (inside etc: in transactions)
+# Build:  mkauto.py -> $POOL_DIR (01-auto.json, 99-overlay.json, nodes.json), engine xrayauto
+# Run:    proxy-unifi.service (xray -confdir), proxy-unifi-picker.service (failover),
+#         proxy-unifi-panel.service (LAN web page; optional, needs a password)
+
+auto_is_active() { [ "$(current_engine)" = "xrayauto" ]; }
+
+auto_ensure_dirs() {
+    prepare_service_permissions
+    mkdir -p "$AUTO_SRC_DIR" "$AUTO_RULES_DIR" || fatal "could not create Auto directories"
+    chown root:"$SERVICE_GROUP" "$AUTO_DIR" && chmod 750 "$AUTO_DIR" \
+        || fatal "could not secure $AUTO_DIR"
+    chmod 700 "$AUTO_SRC_DIR" "$AUTO_RULES_DIR" || fatal "could not secure Auto data"
+    if [ ! -s "$AUTO_PROBE_PASS" ]; then
+        py -c 'import secrets,string;a=string.ascii_letters+string.digits;print("".join(secrets.choice(a) for _ in range(32)),end="")' \
+            | atomic_write "$AUTO_PROBE_PASS" 640 || fatal "could not create the probe password"
+    fi
+    chown root:"$SERVICE_GROUP" "$AUTO_PROBE_PASS" && chmod 640 "$AUTO_PROBE_PASS" \
+        || fatal "could not secure the probe password"
+    for _r in vpn direct; do [ -f "$AUTO_RULES_DIR/$_r.txt" ] || : > "$AUTO_RULES_DIR/$_r.txt"; done
+}
+
+# Build + validate Auto into a stage dir, then swap it in as $POOL_DIR.
+_build_auto() {
+    [ -x "$XRAY" ] || fatal "xray-core is required for Auto mode"
+    ensure_keys
+    auto_ensure_dirs
+    if [ "$(py "$MKAUTO" settings --root "$AUTO_DIR" 2>/dev/null \
+            | py -c 'import json,sys;print(json.load(sys.stdin)["ru_blocked"])')" = "True" ] \
+            && { [ ! -s "$BIN_DIR/ru-geosite.dat" ] || [ ! -s "$BIN_DIR/ru-geoip.dat" ]; }; then
+        info "downloading the ru-blocked lists (first use) ..."
+        auto_geo_fetch || fatal "could not download the ru-blocked lists"
+    fi
+    _stage="$(mktemp -d "$ETC_DIR/.auto.XXXXXX")" || fatal "could not create temp dir"
+    chown root:"$SERVICE_GROUP" "$_stage"; chmod 750 "$_stage"
+    _ab_out="$(py "$MKAUTO" build --root "$AUTO_DIR" --out-dir "$_stage" --geo-dir "$BIN_DIR" \
+        --listen "$WG_LISTEN" --port "$WG_PORT" --address "$XRAY_ADDR" --mtu "$WG_MTU" \
+        --keepalive "$WG_KEEPALIVE" --loglevel "$LOGLEVEL" \
+        --secret-key-file "$WG_DIR/wg_private.key" --peer-pubkey-file "$WG_DIR/unifi_public.key" \
+        --api-port "$AUTO_API_PORT" --probe-port "$AUTO_PROBE_PORT" \
+        --probe-pass-file "$AUTO_PROBE_PASS" 2>"$_stage/.err")" \
+        || { _ab_msg="$(head -n 1 "$_stage/.err")"; rm -rf "$_stage"; fatal "Auto config: ${_ab_msg#*error: }"; }
+    rm -f "$_stage/.err"
+    chown root:"$SERVICE_GROUP" "$_stage"/*.json; chmod 640 "$_stage"/*.json
+    XRAY_LOCATION_ASSET="$BIN_DIR" validate_as_service "$XRAY" run -test -confdir "$_stage" >/dev/null 2>&1 \
+        || { rm -rf "$_stage"; fatal "xray rejected the Auto config (-test failed)"; }
+    ensure_run_dir
+    _old_pool="$RUN_DIR/pool.old"
+    rm -rf "$_old_pool"
+    [ -d "$POOL_DIR" ] && mv "$POOL_DIR" "$_old_pool"
+    mv "$_stage" "$POOL_DIR" || { [ -d "$_old_pool" ] && mv "$_old_pool" "$POOL_DIR"; fatal "could not install Auto config"; }
+    rm -rf "$_old_pool"
+    printf 'xrayauto' | atomic_write "$ENGINE_FILE" 600 || fatal "could not write engine marker"
+    rm -f "$SERVER_CACHE" "$CONFIG" 2>/dev/null || true
+    if [ -f "$SERVICE_FILE" ]; then
+        write_service || fatal "could not update the systemd service"
+    fi
+    write_auto_units || fatal "could not write the Auto units"
+    [ "${_QUIET:-0}" = 1 ] || info "Auto: ${_ab_out#ok	}"
+}
+
+# Rebuild + restart when Auto is the active mode; otherwise the change is only saved.
+auto_apply() {
+    auto_is_active || return 0
+    _QUIET=1 _build_auto
+    restart_service || fatal "the Auto config is valid, but the service failed its health check"
+    systemctl restart "$PICKER_NAME" >/dev/null 2>&1 || true
+}
+
+# Switch the gateway to Auto mode (supersedes a single link / pool / AWG profile).
+auto_enable() {
+    _n="$(auto_source_ids | wc -l | tr -d ' ')"
+    [ "$_n" -gt 0 ] || fatal "add a subscription or a link to Auto first"
+    txn_begin
+    _build_auto
+    rm -f "$OUTBOUND_LINK" "$AWG_SELECTED" "$POOL_SRC" "$SUB_SELECTED" "$SUB_SELECTED_META" 2>/dev/null || true
+    save_settings
+    restart_service || fatal "the Auto config is valid, but the service failed its health check"
+    systemctl enable "$PICKER_NAME" >/dev/null 2>&1 || true
+    systemctl restart "$PICKER_NAME" >/dev/null 2>&1 || fatal "could not start the failover picker"
+    enable_refresh_timer || true
+    txn_commit
+    [ "${_QUIET:-0}" = 1 ] || { c_grn "Auto mode is on."; echo; cmd_wg_config; }
+}
+
+auto_new_id() {
+    py -c 'import secrets;print("s"+secrets.token_hex(4))'
+}
+
+auto_valid_id() {
+    case "$1" in s????????) : ;; *) fatal "unknown source '$1'" ;; esac
+    case "${1#s}" in *[!0-9a-f]*) fatal "unknown source '$1'" ;; esac
+    [ -f "$AUTO_SRC_DIR/$1.json" ] || fatal "unknown source '$1'"
+}
+
+auto_source_ids() {
+    for _f in "$AUTO_SRC_DIR"/s*.json; do
+        [ -f "$_f" ] || continue
+        case "$_f" in *.catalog.json) continue ;; esac
+        _b="$(basename "$_f" .json)"; printf '%s\n' "$_b"
+    done
+}
+
+# Source name: printable, no control characters, at most 60 characters.
+auto_clean_name() {
+    py -c 'import sys,unicodedata
+s=" ".join(sys.argv[1].split())[:60]
+if not s or any(unicodedata.category(c)[0]=="C" for c in s): sys.exit(1)
+print(s,end="")' "$1" || fatal "the name is empty or has control characters"
+}
+
+_auto_write_meta() {   # <id> <type> <name> <enabled>
+    py -c 'import json,sys
+print(json.dumps({"type":sys.argv[1],"name":sys.argv[2],"enabled":sys.argv[3]=="1"},ensure_ascii=False),end="")' \
+        "$2" "$3" "$4" | atomic_write "$AUTO_SRC_DIR/$1.json" 600 || fatal "could not store source $1"
+}
+
+# Fetch one subscription source into <dest>. Secrets stay in mode-600 files.
+_auto_fetch() {   # <id> <dest>
+    _af_hwid="$AUTO_SRC_DIR/$1.hwid"
+    [ -s "$_af_hwid" ] || { sub_hwid >/dev/null; _af_hwid="$SUB_HWID_FILE"; }
+    _af_ua="$(cat "$AUTO_SRC_DIR/$1.ua" 2>/dev/null || true)"; [ -n "$_af_ua" ] || _af_ua="$SUB_USER_AGENT"
+    ensure_run_dir
+    if py "$MKSUB" fetch --url-file "$AUTO_SRC_DIR/$1.url" --hwid-file "$_af_hwid" --ua "$_af_ua" \
+            > "$2" 2>"$RUN_DIR/auto-fetch.err" && [ -s "$2" ]; then
+        chmod 600 "$2"; return 0
+    fi
+    _af_msg=""; IFS= read -r _af_msg < "$RUN_DIR/auto-fetch.err" || true
+    err "${_af_msg#mksub: error: }"
+    rm -f "$2"; return 1
+}
+
+# proxy auto add-sub <name>   (URL on stdin; optional 2nd line: User-Agent)
+auto_add_sub() {
+    _name="$(auto_clean_name "${1:-}")"
+    IFS= read -r _url || [ -n "${_url:-}" ] || fatal "the subscription URL is required on stdin"
+    _ua=""; IFS= read -r _ua || true
+    case "$_url" in https://*) : ;; *) fatal "subscription URL must start with https://" ;; esac
+    auto_ensure_dirs
+    _id="$(auto_new_id)"
+    txn_begin
+    printf '%s' "$_url" | atomic_write "$AUTO_SRC_DIR/$_id.url" 600 || fatal "could not store the URL"
+    if [ -n "$_ua" ]; then
+        { [ "${#_ua}" -le 120 ] && ! LC_ALL=C printf '%s' "$_ua" | grep -q '[^ -~]'; } \
+            && case "$_ua" in *\"*|*\\*) false ;; *) true ;; esac \
+            || fatal "User-Agent must be printable ASCII without quotes or backslashes"
+        printf '%s' "$_ua" | atomic_write "$AUTO_SRC_DIR/$_id.ua" 600 || fatal "could not store the User-Agent"
+    fi
+    _auto_fetch "$_id" "$AUTO_SRC_DIR/$_id.catalog.json" || fatal "subscription not added (fetch/parse failed)"
+    _auto_write_meta "$_id" sub "$_name" 1
+    auto_apply
+    enable_refresh_timer || true
+    txn_commit
+    printf '%s\n' "$_id"
+}
+
+# proxy auto add-link <name>   (share link on stdin)
+auto_add_link() {
+    _name="$(auto_clean_name "${1:-}")"
+    IFS= read -r _link || [ -n "${_link:-}" ] || fatal "the link is required on stdin"
+    case "$_link" in
+        vless://*|vmess://*|trojan://*|ss://*|hysteria2://*|hy2://*) : ;;
+        *) fatal "Auto mode takes vless/vmess/trojan/ss/hysteria2 links" ;;
+    esac
+    [ "${#_link}" -le 8000 ] || fatal "link is too long"
+    auto_ensure_dirs
+    _id="$(auto_new_id)"
+    txn_begin
+    printf '%s' "$_link" | atomic_write "$AUTO_SRC_DIR/$_id.link" 600 || fatal "could not store the link"
+    _auto_write_meta "$_id" link "$_name" 1
+    _why="$(py "$MKAUTO" nodes --root "$AUTO_DIR" | py -c 'import json,sys
+for n in json.load(sys.stdin)["nodes"]:
+    if n["source"]==sys.argv[1] and not n["usable"]: print(n["reason"]); break' "$_id")"
+    [ -z "$_why" ] || fatal "link not added: $_why"
+    auto_apply
+    txn_commit
+    printf '%s\n' "$_id"
+}
+
+auto_del_source() {
+    auto_valid_id "${1:-}"
+    txn_begin
+    rm -f "$AUTO_SRC_DIR/$1.json" "$AUTO_SRC_DIR/$1.url" "$AUTO_SRC_DIR/$1.link" \
+        "$AUTO_SRC_DIR/$1.hwid" "$AUTO_SRC_DIR/$1.ua" "$AUTO_SRC_DIR/$1.catalog.json"
+    if auto_is_active && [ "$(auto_source_ids | wc -l | tr -d ' ')" = 0 ]; then
+        fatal "that is the last source of the running Auto mode; add another first"
+    fi
+    auto_apply
+    txn_commit
+}
+
+auto_toggle_source() {   # <id> on|off
+    auto_valid_id "${1:-}"
+    case "${2:-}" in on) _en=1 ;; off) _en=0 ;; *) fatal "use on or off" ;; esac
+    _meta="$(py -c 'import json,sys;m=json.load(open(sys.argv[1]));print(m["type"]);print(m.get("name",""))' "$AUTO_SRC_DIR/$1.json")"
+    _type="$(printf '%s\n' "$_meta" | sed -n 1p)"; _nm="$(printf '%s\n' "$_meta" | sed -n 2p)"
+    txn_begin
+    _auto_write_meta "$1" "$_type" "$_nm" "$_en"
+    auto_apply
+    txn_commit
+}
+
+# Refresh every subscription source; a failed one keeps its previous catalog.
+auto_refresh() {
+    auto_ensure_dirs
+    ensure_run_dir
+    _changed=0; _failed=0
+    for _id in $(auto_source_ids); do
+        [ -f "$AUTO_SRC_DIR/$_id.url" ] || continue
+        _cand="$RUN_DIR/$_id.catalog"
+        if _auto_fetch "$_id" "$_cand"; then
+            if ! cmp -s "$_cand" "$AUTO_SRC_DIR/$_id.catalog.json"; then
+                _changed=1
+                [ -n "$TXN_DIR" ] || txn_begin
+                atomic_write "$AUTO_SRC_DIR/$_id.catalog.json" 600 < "$_cand" || fatal "could not store catalog"
+            fi
+        else
+            _failed=$((_failed + 1)); err "source $_id: refresh failed; keeping its previous servers"
+        fi
+    done
+    if [ "$_changed" = 1 ]; then auto_apply; txn_commit; fi
+    [ "${_AUTO_REFRESH:-0}" = 1 ] || c_grn "Sources refreshed (changed: $_changed, failed: $_failed)."
+}
+
+# proxy auto rule add|del vpn|direct <value>
+auto_rule() {
+    _op="${1:-}"; _list="${2:-}"; _val="${3:-}"
+    case "$_list" in vpn|direct) : ;; *) fatal "rule list must be vpn or direct" ;; esac
+    auto_ensure_dirs
+    _norm="$(py "$MKAUTO" rule --value "$_val" 2>&1)" || fatal "${_norm#*error: }"
+    _norm="${_norm#*"$TAB"}"
+    _file="$AUTO_RULES_DIR/$_list.txt"
+    ensure_run_dir
+    txn_begin
+    case "$_op" in
+        add)
+            for _other in vpn direct; do
+                [ "$_other" = "$_list" ] && continue
+                grep -qxF "$_norm" "$AUTO_RULES_DIR/$_other.txt" 2>/dev/null \
+                    && fatal "$_norm is already in the $_other list"
+            done
+            grep -qxF "$_norm" "$_file" 2>/dev/null && fatal "$_norm is already in the $_list list"
+            { cat "$_file" 2>/dev/null; printf '%s\n' "$_norm"; } > "$RUN_DIR/rules.new" ;;
+        del)
+            grep -qxF "$_norm" "$_file" 2>/dev/null || fatal "$_norm is not in the $_list list"
+            grep -vxF "$_norm" "$_file" > "$RUN_DIR/rules.new" || true ;;
+        *) fatal "use: rule add|del vpn|direct <domain or IP>" ;;
+    esac
+    atomic_write "$_file" 600 < "$RUN_DIR/rules.new" || fatal "could not store rules"
+    auto_apply
+    txn_commit
+}
+
+# proxy auto set mode list|all | order DE,PL,.. | ru_blocked on|off
+auto_set() {
+    case "${1:-}" in mode|order|ru_blocked) : ;; *) fatal "use: set mode|order|ru_blocked <value>" ;; esac
+    auto_ensure_dirs
+    ensure_run_dir
+    _new="$(py "$MKAUTO" settings --root "$AUTO_DIR" --set "$1=${2:-}" 2>&1)" || fatal "${_new#*error: }"
+    txn_begin
+    printf '%s\n' "$_new" | atomic_write "$AUTO_DIR/auto.json" 600 || fatal "could not store settings"
+    auto_apply
+    txn_commit
+}
+
+# proxy auto node disable|enable|pin|unpin <node id> | node country <id> <CC|->
+auto_node() {
+    _op="${1:-}"; _nid="${2:-}"
+    case "$_nid" in *[!0-9a-f]*|"") fatal "a node id is required" ;; esac
+    [ "${#_nid}" = 64 ] || fatal "a node id is required"
+    auto_ensure_dirs
+    _cur="$(py "$MKAUTO" settings --root "$AUTO_DIR")" || fatal "settings are unreadable"
+    _set="$(printf '%s' "$_cur" | py -c 'import json,sys
+s=json.load(sys.stdin); op,nid,cc=sys.argv[1:4]
+def put(k,add):
+    l=[x for x in s[k] if x!=nid]
+    if add: l.append(nid)
+    print(k+"="+json.dumps(l))
+if op=="disable": put("disabled",True)
+elif op=="enable": put("disabled",False)
+elif op=="pin": put("pinned",True)
+elif op=="unpin": put("pinned",False)
+elif op=="country":
+    c=dict(s["country"]); c.pop(nid,None)
+    if cc and cc!="-": c[nid]=cc.upper()
+    print("country="+json.dumps(c))
+else: sys.exit(1)' "$_op" "$_nid" "${3:-}")" || fatal "use: node disable|enable|pin|unpin <id> | node country <id> <CC|->"
+    _new="$(py "$MKAUTO" settings --root "$AUTO_DIR" --set "$_set" 2>&1)" || fatal "${_new#*error: }"
+    txn_begin
+    printf '%s\n' "$_new" | atomic_write "$AUTO_DIR/auto.json" 600 || fatal "could not store settings"
+    auto_apply
+    txn_commit
+}
+
+# proxy auto hwid [UUID]  -- the device id sent as x-hwid (default for every subscription)
+auto_hwid() {
+    if [ -z "${1:-}" ]; then sub_hwid; echo; return; fi
+    py -c 'import sys,uuid;uuid.UUID(sys.argv[1])' "$1" 2>/dev/null || fatal "HWID must be a UUID"
+    mkdir -p "$SUB_DIR"; chmod 700 "$SUB_DIR"
+    txn_begin
+    printf '%s' "$1" | atomic_write "$SUB_HWID_FILE" 600 || fatal "could not store HWID"
+    txn_commit
+    c_grn "HWID set. Refresh subscriptions to use it."
+}
+
+# runetfreedom ru-blocked lists, verified against the release's published digests.
+auto_geo_fetch() {
+    mkdir -p "$BIN_DIR"; ensure_run_dir
+    _tag="$(resolve_latest_tag "https://github.com/$RU_GEO_REPO/releases")"
+    [ -n "$_tag" ] || { err "could not resolve the ru-blocked release"; return 1; }
+    for _pair in geosite.dat:ru-geosite.dat geoip.dat:ru-geoip.dat; do
+        _src="${_pair%%:*}"; _dst="${_pair#*:}"
+        info "downloading $_dst ($_tag) ..."
+        download_to "https://github.com/$RU_GEO_REPO/releases/download/${_tag}/$_src" "$RUN_DIR/$_dst" 314572800 \
+            || { err "failed to fetch $_src"; return 1; }
+        _want="$(github_asset_digest "$RU_GEO_REPO" "$_tag" "$_src" 2>/dev/null)" \
+            || { rm -f "$RUN_DIR/$_dst"; err "could not obtain the digest of $_src"; return 1; }
+        verify_sha256 "$RUN_DIR/$_dst" "$_want" || { rm -f "$RUN_DIR/$_dst"; return 1; }
+        { chmod 644 "$RUN_DIR/$_dst" && mv -f "$RUN_DIR/$_dst" "$BIN_DIR/$_dst.new" \
+            && mv -f "$BIN_DIR/$_dst.new" "$BIN_DIR/$_dst"; } || { err "could not install $_dst"; return 1; }
+    done
+}
+
+auto_geo_update() {
+    auto_geo_fetch || fatal "ru-blocked lists were not updated"
+    if auto_is_active; then
+        restart_service || fatal "service failed its health check after the list update"
+        systemctl restart "$PICKER_NAME" >/dev/null 2>&1 || true
+    fi
+    c_grn "ru-blocked lists updated."
+}
+
+# Everything the panel/menu shows, as one JSON document (no secrets).
+auto_status_json() {
+    py - "$AUTO_DIR" "$AUTO_STATE_DIR" "$MKAUTO" "$(current_engine)" "$(auto_lan_ip 2>/dev/null)" "$PANEL_PORT" <<'PYEOF'
+import json, os, subprocess, sys
+root, state, mkauto, engine, lan, pport = sys.argv[1:7]
+def load(p, d):
+    try:
+        with open(p, encoding="utf-8") as fh: return json.load(fh)
+    except Exception: return d
+def lines(p):
+    try:
+        with open(p, encoding="utf-8") as fh: return [l.strip() for l in fh if l.strip()]
+    except Exception: return []
+r = subprocess.run([sys.executable, mkauto, "nodes", "--root", root], capture_output=True, text=True)
+nodes = json.loads(r.stdout) if r.returncode == 0 else {"nodes": [], "error": r.stderr.strip()[-200:]}
+s = subprocess.run([sys.executable, mkauto, "settings", "--root", root], capture_output=True, text=True)
+sources = []
+sd = os.path.join(root, "sources")
+for f in sorted(os.listdir(sd)) if os.path.isdir(sd) else []:
+    if f.endswith(".json") and not f.endswith(".catalog.json"):
+        m = load(os.path.join(sd, f), {})
+        cat = load(os.path.join(sd, f[:-5] + ".catalog.json"), {})
+        sources.append({"id": f[:-5], "type": m.get("type"), "name": m.get("name"),
+                        "enabled": m.get("enabled", True) is not False,
+                        "fetched": int(os.path.getmtime(os.path.join(sd, f[:-5] + ".catalog.json")))
+                        if os.path.exists(os.path.join(sd, f[:-5] + ".catalog.json")) else None,
+                        "userinfo": (cat.get("meta") or {}).get("userinfo", "")})
+log = lines(os.path.join(state, "switches.log"))[-50:]
+print(json.dumps({"engine": engine, "auto_active": engine == "xrayauto",
+                  "settings": json.loads(s.stdout) if s.returncode == 0 else {},
+                  "sources": sources, "nodes": nodes.get("nodes", []),
+                  "health": load(os.path.join(state, "status.json"), {}),
+                  "switches": [l.split("\t") for l in log],
+                  "rules": {"vpn": lines(os.path.join(root, "rules", "vpn.txt")),
+                            "direct": lines(os.path.join(root, "rules", "direct.txt"))},
+                  "panel": {"lan": lan, "port": int(pport)}}, ensure_ascii=False))
+PYEOF
+}
+
+auto_status_text() {
+    auto_status_json | py -c 'import json,sys
+d=json.load(sys.stdin); s=d["settings"]; h=d.get("health") or {}
+print("Auto mode:   %s" % ("ON" if d["auto_active"] else "off (engine: %s)" % d["engine"]))
+print("Traffic:     %s" % ("only listed traffic uses VPN" if s.get("mode")=="list" else "everything uses VPN except the direct list"))
+print("Countries:   %s" % " -> ".join(s.get("order",[])))
+print("ru-blocked:  %s" % ("on" if s.get("ru_blocked") else "off"))
+print("Active:      %s" % (h.get("active_label") or "-"))
+print()
+print("Sources:")
+for x in d["sources"]:
+    print("  %s  %-4s %-3s %s" % (x["id"], x["type"], "on" if x["enabled"] else "OFF", x["name"]))
+print()
+hb={n["tag"]:n for n in h.get("nodes",[])}
+print("Servers (priority order):")
+for n in d["nodes"]:
+    st=hb.get(n["tag"],{})
+    if not n["usable"]: state="--  "+n["reason"]
+    elif st.get("ok"): state="up  %s ms" % st.get("rtt")
+    else: state="down"
+    mark="*" if h.get("active")==n["tag"] else " "
+    print(" %s%2d %-2s %-36s %s%s" % (mark, n["priority"]+1, n["country"] or "??", n["label"][:36], state, "  [pinned]" if n.get("pinned") else ""))
+print()
+print("VPN list:    %d entries; direct list: %d entries" % (len(d["rules"]["vpn"]), len(d["rules"]["direct"])))'
+}
+
+# LAN address of the gateway for the panel (br0 on UniFi OS), or PANEL_LISTEN.
+auto_lan_ip() {
+    if [ -n "$PANEL_LISTEN" ] && [ "$PANEL_LISTEN" != "auto" ]; then printf '%s' "$PANEL_LISTEN"; return 0; fi
+    _ip="$(ip -4 -o addr show dev br0 2>/dev/null | awk '{print $4}' | head -n 1)"
+    _ip="${_ip%/*}"
+    [ -n "$_ip" ] || return 1
+    printf '%s' "$_ip"
+}
+
+# proxy auto panel-password  (new password on stdin; empty = turn the panel off)
+auto_panel_password() {
+    IFS= read -r _pw || true
+    txn_begin
+    if [ -z "${_pw:-}" ]; then
+        rm -f "$PANEL_PASS_FILE"
+        systemctl disable --now "$PANEL_NAME" >/dev/null 2>&1 || true
+        txn_commit; c_ylw "Panel turned off."; return 0
+    fi
+    [ "${#_pw}" -ge 8 ] || fatal "use at least 8 characters"
+    printf '%s' "$_pw" | py "$PANEL" --hash-password | atomic_write "$PANEL_PASS_FILE" 600 \
+        || fatal "could not store the panel password"
+    write_auto_units || fatal "could not write the panel unit"
+    systemctl enable "$PANEL_NAME" >/dev/null 2>&1 || true
+    systemctl restart "$PANEL_NAME" >/dev/null 2>&1 || fatal "the panel did not start"
+    txn_commit
+    _lan="$(auto_lan_ip || echo '?')"
+    c_grn "Panel: http://$_lan:$PANEL_PORT/"
+}
+
+write_auto_units() {
+    atomic_write "$PICKER_SERVICE_FILE" 644 <<EOF || return 1
+[Unit]
+Description=proxy-unifi Auto mode failover picker
+After=$SERVICE_NAME.service
+BindsTo=$SERVICE_NAME.service
+ConditionPathExists=$POOL_DIR/01-auto.json
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_GROUP
+UMask=0027
+ExecStartPre=+/bin/sh -c 'mkdir -p $AUTO_STATE_DIR && chown $SERVICE_USER:$SERVICE_GROUP $AUTO_STATE_DIR && chmod 750 $AUTO_STATE_DIR'
+ExecStart=/usr/bin/env python3 $PICKER --nodes-file $POOL_DIR/nodes.json --probe-pass-file $AUTO_PROBE_PASS --state-dir $AUTO_STATE_DIR --xray $XRAY --api-port $AUTO_API_PORT --probe-port $AUTO_PROBE_PORT --url $PING_URL
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=$ROOT
+ReadWritePaths=$AUTO_STATE_DIR
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=96M
+TasksMax=64
+
+[Install]
+WantedBy=$SERVICE_NAME.service
+EOF
+    _lan="$(auto_lan_ip 2>/dev/null || true)"
+    atomic_write "$PANEL_SERVICE_FILE" 644 <<EOF || return 1
+[Unit]
+Description=proxy-unifi Auto mode web panel (LAN only)
+After=network-online.target
+ConditionPathExists=$PANEL_PASS_FILE
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 $PANEL --listen ${_lan:-127.0.0.1} --port $PANEL_PORT --password-file $PANEL_PASS_FILE --cli $BIN_DIR/proxy-unifi
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=96M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+}
+
+remove_auto_units() {
+    systemctl disable --now "$PICKER_NAME" "$PANEL_NAME" >/dev/null 2>&1 || true
+    rm -f "$PICKER_SERVICE_FILE" "$PANEL_SERVICE_FILE"
+}
+
+# `proxy auto ...` -- the non-interactive interface (the panel calls it too).
+cmd_auto() {
+    _sub="${1:-status}"; [ $# -ge 1 ] && shift
+    case "$_sub" in
+        status)       auto_status_text ;;
+        status-json)  auto_status_json ;;
+        enable)       auto_enable ;;
+        add-sub)      auto_add_sub "$@" ;;
+        add-link)     auto_add_link "$@" ;;
+        del)          auto_del_source "$@" ;;
+        source)       auto_toggle_source "$@" ;;
+        refresh)      auto_refresh ;;
+        rule)         auto_rule "$@" ;;
+        set)          auto_set "$@" ;;
+        node)         auto_node "$@" ;;
+        hwid)         auto_hwid "$@" ;;
+        geo-update)   auto_geo_update ;;
+        panel-password) auto_panel_password ;;
+        *) fatal "unknown: proxy auto $_sub (status, enable, add-sub, add-link, del, source, refresh, rule, set, node, hwid, geo-update, panel-password)" ;;
+    esac
+}
+
+menu_auto() {
+    while true; do
+        echo
+        auto_status_text 2>/dev/null || true
+        echo
+        echo "  1. Turn Auto mode on (all sources, failover)"
+        echo "  2. Add a subscription"
+        echo "  3. Add a single link"
+        echo "  4. Turn a source off/on, or delete it"
+        echo "  5. Refresh subscriptions now"
+        echo "  6. Traffic: only listed via VPN / everything via VPN"
+        echo "  7. Country order"
+        echo "  8. ru-blocked list on/off"
+        echo "  9. Add/remove a domain or IP (VPN or direct list)"
+        echo " 10. Set HWID (sent to subscriptions)"
+        echo " 11. Web panel password (empty = off)"
+        echo "  0. Back"
+        printf 'Choice: '; read -r _a || return 0
+        case "$_a" in
+            0|"") return 0 ;;
+            1) ( locked_call auto_enable ) ;;
+            2) printf 'Name: '; read -r _n || true; printf 'Subscription URL: '; read -r _u || true
+               ( printf '%s\n' "$_u" | locked_call auto_add_sub "$_n" >/dev/null && c_grn "Added." ) ;;
+            3) printf 'Name: '; read -r _n || true; printf 'Link: '; read -r _u || true
+               ( printf '%s\n' "$_u" | locked_call auto_add_link "$_n" >/dev/null && c_grn "Added." ) ;;
+            4) printf 'Source id: '; read -r _s || true; printf 'off / on / delete: '; read -r _o || true
+               case "$_o" in delete) ( locked_call auto_del_source "$_s" ) ;; *) ( locked_call auto_toggle_source "$_s" "$_o" ) ;; esac ;;
+            5) ( locked_call auto_refresh ) ;;
+            6) printf 'list = only listed via VPN, all = everything via VPN: '; read -r _m || true
+               ( locked_call auto_set mode "$_m" ) ;;
+            7) printf 'Countries in order, e.g. DE,PL,FI,NL: '; read -r _m || true
+               ( locked_call auto_set order "$_m" ) ;;
+            8) printf 'on / off: '; read -r _m || true; ( locked_call auto_set ru_blocked "$_m" ) ;;
+            9) printf 'add / del: '; read -r _o || true; printf 'vpn / direct: '; read -r _l || true
+               printf 'Domain or IP/CIDR: '; read -r _v || true; ( locked_call auto_rule "$_o" "$_l" "$_v" ) ;;
+            10) printf 'HWID (UUID): '; read -r _h || true; ( locked_call auto_hwid "$_h" ) ;;
+            11) stty -echo 2>/dev/null; printf 'New panel password: '; read -r _p || true; stty echo 2>/dev/null; echo
+                ( printf '%s\n' "$_p" | locked_call auto_panel_password ) ;;
+            *) c_red "Invalid selection." ;;
+        esac
+        pause
+    done
 }
 
 # --------------------------------------------------------------------------
@@ -3142,6 +3758,9 @@ case "$cmd" in
     _fw-reconcile) need_root; if lock_busy; then exit 0; fi; acquire_lock; recover_transaction ;;
     _update|install-binary|install-service|boot-recover|sub-refresh-auto)
         need_root; acquire_lock; recover_transaction ;;
+    # Reads need no lock (the panel polls them); changes take it like the menu.
+    auto) need_root
+        case "${1:-status}" in status|status-json) : ;; *) acquire_lock; recover_transaction ;; esac ;;
     *) err "proxy has no command '$cmd': run 'proxy' for the menu"; exit 1 ;;
 esac
 load_settings
@@ -3157,7 +3776,10 @@ case "$cmd" in
     install-service) install_service ;;
     boot-recover)    boot_recover ;;
     _fw-reconcile)   fw_reconcile ;;
-    sub-refresh-auto) _AUTO_REFRESH=1 sub_refresh ;;
+    sub-refresh-auto)
+        if [ -s "$SUB_URL_FILE" ]; then _AUTO_REFRESH=1 sub_refresh || true; fi
+        if [ -n "$(ls "$AUTO_SRC_DIR"/*.url 2>/dev/null)" ]; then _AUTO_REFRESH=1 auto_refresh; fi ;;
+    auto)         cmd_auto "$@" ;;
     _fw-lock)        fw_lock ;;
     _fw-unlock)      fw_unlock ;;
 esac

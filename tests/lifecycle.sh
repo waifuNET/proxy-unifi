@@ -19,7 +19,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
-for f in mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py proxylib.py safeexec.py; do
+for f in mkxray.py mksingbox.py mksub.py mkawg.py mkjson.py mkauto.py picker.py panel.py proxylib.py safeexec.py; do
     cp "$REPO/src/$f" "$T/root/bin/$f"
 done
 cp "$XRAY_SRC" "$T/root/bin/xray"
@@ -39,6 +39,8 @@ sed \
     -e "s|^GUARD_TIMER_FILE=.*|GUARD_TIMER_FILE=\"$T/proxy-unifi-guard.timer\"|" \
     -e "s|^AU_SERVICE_FILE=.*|AU_SERVICE_FILE=\"$T/proxy-unifi-autoupdate.service\"|" \
     -e "s|^AU_TIMER_FILE=.*|AU_TIMER_FILE=\"$T/proxy-unifi-autoupdate.timer\"|" \
+    -e "s|^PICKER_SERVICE_FILE=.*|PICKER_SERVICE_FILE=\"$T/proxy-unifi-picker.service\"|" \
+    -e "s|^PANEL_SERVICE_FILE=.*|PANEL_SERVICE_FILE=\"$T/proxy-unifi-panel.service\"|" \
     -e "s|^ONBOOT_DST=.*|ONBOOT_DST=\"$T/on_boot.sh\"|" \
     -e "s|^PROXY_LINK=\"/usr/bin/proxy\"|PROXY_LINK=\"$T/proxy\"|" \
     "$REPO/src/proxy-unifi" > "$T/root/bin/proxy-base"
@@ -208,8 +210,8 @@ positions=[plain.index(label) for label in
             "Import an Xray JSON profile")]
 assert positions == sorted(positions), positions
 numbers=[int(x) for x in re.findall(r"│\s+([0-9]+)\. ", plain)]
-assert numbers == list(range(20)), numbers
-assert "[0-19]" in plain
+assert numbers == list(range(21)), numbers
+assert "[0-20]" in plain
 PY
 
 # Only the menu takes people's commands; automatic updates are off until turned

@@ -407,6 +407,25 @@ def _json_profile_from_ss_wrapper(link, parsed, label_hint):
     return None
 
 
+# Happ appends "?serverDescription=<base64>" to a node's name; it is a tooltip,
+# not part of the name.
+_DESC_RE = re.compile(r"\?serverDescription=[A-Za-z0-9+/=_-]*\s*$")
+# Exit country = the LAST flag in the name ("🇷🇺 → 🇩🇪 Germany" exits in DE).
+_FLAG_RE = re.compile("([\U0001F1E6-\U0001F1FF])([\U0001F1E6-\U0001F1FF])")
+
+
+def strip_description(label):
+    return _DESC_RE.sub("", label or "").rstrip()
+
+
+def country_from_label(label):
+    flags = _FLAG_RE.findall(label or "")
+    if not flags:
+        return ""
+    a, b = flags[-1]
+    return chr(ord(a) - 0x1F1E6 + 65) + chr(ord(b) - 0x1F1E6 + 65)
+
+
 def node_from_link(link):
     """Return a node dict for a recognized proxy URI, or None to skip the line.
 
@@ -448,6 +467,8 @@ def node_from_link(link):
     try:
         node["label"], destination, node["server"] = _link_details(
             parsed, scheme, legacy_vmess)
+        node["label"] = strip_description(node["label"])
+        node["country"] = country_from_label(node["label"])
         if scheme in ("hysteria2", "hy2", "tuic"):
             node["engine"] = "singbox"
         elif scheme == "ss":

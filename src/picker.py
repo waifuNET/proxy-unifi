@@ -164,7 +164,7 @@ class Picker:
         if rtt is None:
             h["fails"] += 1
             h["ups"] = 0
-            if h["fails"] >= FAIL_LIMIT or h["rtt"] is None:
+            if h["fails"] >= FAIL_LIMIT:
                 h["ok"] = False
         else:
             h["fails"] = 0
@@ -187,10 +187,18 @@ class Picker:
         c = node.get("country", "")
         return self.order.index(c) if c in self.order else len(self.order) + (0 if c else 1)
 
+    def undetermined(self):
+        """Nodes that never answered and have not yet failed FAIL_LIMIT times."""
+        return [n for n in self.nodes if not self._h(n["tag"])["last_ok"]
+                and self._h(n["tag"])["fails"] < FAIL_LIMIT]
+
     def choose(self):
+        """Tag to route VPN traffic to, "block", or None (not known yet)."""
         live = [n for n in self.nodes if self._h(n["tag"])["ok"]]
         if not live:
-            return "block"
+            # Right after a (re)start nothing has answered yet: the kill
+            # switch waits until every node really failed FAIL_LIMIT times.
+            return None if self.undetermined() else "block"
         by_tag = {n["tag"]: n for n in self.nodes}
         cur = by_tag.get(self.active)
         cur_ok = cur is not None and self._h(cur["tag"])["ok"]
@@ -226,6 +234,8 @@ class Picker:
     # ------------------------------------------------------------ apply
 
     def apply(self, tag, force=False):
+        if tag is None:
+            return
         changed = tag != self.active
         if not changed and not force:
             return
@@ -299,7 +309,7 @@ class Picker:
             self.write_status()
             return
         now = time.monotonic()
-        full = now - self.last_full >= FULL_INTERVAL
+        full = now - self.last_full >= FULL_INTERVAL or bool(self.undetermined())
         if full:
             self.probe_many([n["tag"] for n in self.nodes], True)
             self.last_full = now
@@ -308,7 +318,18 @@ class Picker:
         self.apply(self.choose(), force=full)
         self.write_status()
 
+    def wait_for_core(self, limit=60):
+        """The probe inbound opens when xray is up; until then probes mean nothing."""
+        end = time.monotonic() + limit
+        while time.monotonic() < end:
+            try:
+                socket.create_connection(("127.0.0.1", self.args.probe_port), timeout=1).close()
+                return
+            except OSError:
+                time.sleep(0.5)
+
     def run(self):
+        self.wait_for_core()
         while True:
             started = time.monotonic()
             self.step()
@@ -331,6 +352,7 @@ def main():
         sys.exit(2)
     p = Picker(args)
     if args.once:
+        p.wait_for_core(10)
         p.reload_nodes()
         for _ in range(UP_LIMIT):
             p.probe_many([n["tag"] for n in p.nodes], True)

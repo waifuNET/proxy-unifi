@@ -138,6 +138,14 @@ class Choice(unittest.TestCase):
         self.down(p, "pl1"); self.down(p, "fi1")
         self.assertEqual(p.choose(), "block")
 
+    def test_no_kill_switch_before_nodes_are_known(self):
+        p = self.make([("de1", "DE", False), ("pl1", "PL", False)])
+        self.assertIsNone(p.choose())           # nothing probed yet
+        p.record("de1", None, True); p.record("pl1", None, True)
+        self.assertIsNone(p.choose())           # one failure each: still unknown
+        p.record("de1", None, True); p.record("pl1", None, True)
+        self.assertEqual(p.choose(), "block")   # FAIL_LIMIT failures: really down
+
     def test_one_failed_probe_does_not_switch(self):
         p = self.make([("de1", "DE", False), ("pl1", "PL", False)])
         self.up(p, "de1", 100); self.up(p, "pl1", 50)

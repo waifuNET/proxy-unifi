@@ -2,7 +2,7 @@
 # install.sh - installer for proxy-unifi on UniFi Cloud Gateways / UniFi OS devices.
 #
 # Usage (on the gateway, via SSH as root):
-#   curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/proxy-unifi/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/waifuNET/proxy-unifi/main/install.sh | sh
 # or, from a local clone:
 #   ./install.sh
 #
@@ -11,7 +11,7 @@
 set -eu
 umask 077
 
-PROJECT_REPO="palmbeachpete9/proxy-unifi"
+PROJECT_REPO="waifuNET/proxy-unifi"
 # The branch this installer belongs to (experimental's says experimental).
 # PROXY_UNIFI_COMMIT pins the run to one commit of it, as the CLI's updates do.
 BRANCH="${PROXY_UNIFI_BRANCH:-main}"

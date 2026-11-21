@@ -57,6 +57,7 @@ DEFAULTS = {
     "mode": "list",            # list: only listed traffic uses VPN; all: everything but "direct"
     "order": ["DE", "PL", "FI", "NL"],
     "ru_blocked": True,        # runetfreedom ru-blocked lists (domains + IPs) count as "VPN"
+    "ru_direct": True,         # big Russian services (TV, banks, gov, VK, Yandex...) stay direct
     "disabled": [],            # node ids never used
     "pinned": [],              # node ids preferred first inside their country
     "country": {},             # node id -> country code override
@@ -79,6 +80,28 @@ PRIVATE_NETS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"
                 "fc00::/7", "fe80::/10", "::1/128", "ff00::/8"]
 RU_GEOSITE = "ru-geosite.dat"
 RU_GEOIP = "ru-geoip.dat"
+# ru_direct: Russian services that refuse foreign IPs or are slow through the
+# VPN. Matched after the ru-blocked domain list (a blocked domain still uses
+# the VPN) but before the ru-blocked IP list, whose wide CDN ranges otherwise
+# catch Russian video CDNs. category-ru is deliberately absent: it lists whole
+# TLDs and ~20k blocked sites.
+RU_DIRECT_CATEGORIES = [
+    "ru-available-only-inside", "category-gov-ru", "category-bank-ru",
+    "category-entertainment-ru", "category-media-ru", "category-ecommerce-ru",
+    "category-retail-ru", "vk", "yandex", "mailru-group", "mts-ru", "tbank-ru", "rutube",
+]
+# Online cinemas, TV channels and IPTV apps the categories miss (smart TVs).
+RU_DIRECT_DOMAINS = [
+    "kinopoisk.ru", "ivi.ru", "ivi.tv", "okko.tv", "okko.sport", "playfamily.ru",
+    "wink.ru", "rt.ru", "ngenix.net", "start.ru", "premier.one", "kion.ru",
+    "more.tv", "amediateka.ru", "1tv.ru", "1tv.com", "smotrim.ru", "vgtrk.com",
+    "vgtrk.ru", "ntv.ru", "ctc.ru", "ctc-media.ru", "videomore.ru", "tnt-online.ru",
+    "gpm.ru", "gpmd.ru", "matchtv.ru", "friday.ru", "tv3.ru", "ren.tv", "5-tv.ru",
+    "smotreshka.tv", "lfstrm.tv", "24h.tv", "24htv.platform24.tv", "peers.tv",
+    "limehd.tv", "megafon.tv", "beeline.tv", "tricolor.tv", "ntvplus.ru",
+    "movix.ru", "dom.ru", "zvuk.com", "sber.ru", "sberbank.ru", "sberdevices.ru",
+    "salute.ru", "kinoteatr.ru", "tvzavr.ru", "liveinternet.ru",
+]
 
 
 # ---------------------------------------------------------------- rules
@@ -170,8 +193,9 @@ def validate_settings(s):
             or not all(isinstance(c, str) and CC_RE.match(c) for c in s["order"]) \
             or len(set(s["order"])) != len(s["order"]):
         die("order must be a list of distinct two-letter country codes")
-    if not isinstance(s["ru_blocked"], bool):
-        die("ru_blocked must be true/false")
+    for key in ("ru_blocked", "ru_direct"):
+        if not isinstance(s[key], bool):
+            die("%s must be true/false" % key)
     for key in ("disabled", "pinned"):
         if not isinstance(s[key], list) or len(s[key]) > 4096 \
                 or not all(isinstance(x, str) and NODE_ID_RE.match(x) for x in s[key]):
@@ -199,9 +223,9 @@ def apply_setting(s, key, value):
                 die("self_hosts takes a comma list or JSON")
         else:
             s[key] = [h.strip().lower() for h in value.split(",") if h.strip()]
-    elif key == "ru_blocked":
+    elif key in ("ru_blocked", "ru_direct"):
         if value not in ("on", "off", "true", "false", "1", "0"):
-            die("ru_blocked takes on/off")
+            die("%s takes on/off" % key)
         s[key] = value in ("on", "true", "1")
     else:
         try:
@@ -399,13 +423,22 @@ def build_config(args, settings, nodes, probe_pass):
         rules.append({"type": "field", "inboundTag": ["wg-in"], "domain": v_dom, "balancerTag": "vpn"})
     if v_ip:
         rules.append({"type": "field", "inboundTag": ["wg-in"], "ip": v_ip, "balancerTag": "vpn"})
+    use_ru_blocked = settings["mode"] == "list" and settings["ru_blocked"]
+    need = ([RU_GEOSITE, RU_GEOIP] if use_ru_blocked else []) \
+        + ([RU_GEOSITE] if settings["ru_direct"] else [])
+    for f in sorted(set(need)):
+        if not os.path.isfile(os.path.join(args.geo_dir, f)):
+            die("the ru-blocked list is not downloaded yet (%s)" % f)
+    if use_ru_blocked or settings["ru_direct"]:
+        # A blocked domain uses the VPN even when a Russian category lists it.
+        rules.append({"type": "field", "inboundTag": ["wg-in"],
+                      "domain": ["ext:%s:ru-blocked" % RU_GEOSITE], "balancerTag": "vpn"})
+    if settings["ru_direct"]:
+        rules.append({"type": "field", "inboundTag": ["wg-in"], "outboundTag": "direct",
+                      "domain": ["ext:%s:%s" % (RU_GEOSITE, c) for c in RU_DIRECT_CATEGORIES]
+                      + ["domain:" + d for d in RU_DIRECT_DOMAINS]})
     if settings["mode"] == "list":
-        if settings["ru_blocked"]:
-            for f in (RU_GEOSITE, RU_GEOIP):
-                if not os.path.isfile(os.path.join(args.geo_dir, f)):
-                    die("the ru-blocked list is not downloaded yet (%s)" % f)
-            rules.append({"type": "field", "inboundTag": ["wg-in"],
-                          "domain": ["ext:%s:ru-blocked" % RU_GEOSITE], "balancerTag": "vpn"})
+        if use_ru_blocked:
             rules.append({"type": "field", "inboundTag": ["wg-in"],
                           "ip": ["ext:%s:ru-blocked" % RU_GEOIP], "balancerTag": "vpn"})
         rules.append({"type": "field", "inboundTag": ["wg-in"], "outboundTag": "direct"})

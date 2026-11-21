@@ -94,7 +94,7 @@ class SelfRoute(unittest.TestCase):
         import argparse
         args = argparse.Namespace(root="/nonexistent", geo_dir="/nonexistent",
                                   api_port=51822, probe_port=51823, self_port=51830)
-        settings = dict(mkauto.DEFAULTS, mode="list", ru_blocked=False)
+        settings = dict(mkauto.DEFAULTS, mode="list", ru_blocked=False, ru_direct=False)
         node = {"usable": True, "tag": "n-1",
                 "_outbound": {"tag": "n-1", "protocol": "freedom", "settings": {}}}
         cfg = mkauto.build_config(args, settings, [node], "x" * 16)
@@ -104,6 +104,39 @@ class SelfRoute(unittest.TestCase):
         self.assertTrue(all(i["listen"] == "127.0.0.1" for i in selfs))
         rule = [r for r in cfg["routing"]["rules"] if "self-0" in r.get("inboundTag", [])]
         self.assertEqual(rule[0].get("balancerTag"), "vpn")
+
+    def test_ru_direct_sits_between_blocked_domains_and_blocked_ips(self):
+        import argparse, tempfile
+        geo = tempfile.mkdtemp()
+        for f in (mkauto.RU_GEOSITE, mkauto.RU_GEOIP):
+            open(os.path.join(geo, f), "w").close()
+        args = argparse.Namespace(root="/nonexistent", geo_dir=geo,
+                                  api_port=51822, probe_port=51823, self_port=51830)
+        node = {"usable": True, "tag": "n-1",
+                "_outbound": {"tag": "n-1", "protocol": "freedom", "settings": {}}}
+
+        def wg_rules(**kw):
+            cfg = mkauto.build_config(args, dict(mkauto.DEFAULTS, **kw), [node], "x" * 16)
+            return [(r.get("outboundTag") or r.get("balancerTag"),
+                     (r.get("domain") or r.get("ip") or ["*"])[0])
+                    for r in cfg["routing"]["rules"]
+                    if r.get("inboundTag") == ["wg-in"] and r.get("ip") != mkauto.PRIVATE_NETS]
+        geosite = "ext:ru-geosite.dat:"
+        self.assertEqual(wg_rules(mode="list"), [
+            ("vpn", geosite + "ru-blocked"),
+            ("direct", geosite + mkauto.RU_DIRECT_CATEGORIES[0]),
+            ("vpn", "ext:ru-geoip.dat:ru-blocked"),
+            ("direct", "*")])
+        self.assertEqual(wg_rules(mode="all"), [
+            ("vpn", geosite + "ru-blocked"),
+            ("direct", geosite + mkauto.RU_DIRECT_CATEGORIES[0]),
+            ("vpn", "*")])
+        self.assertEqual(wg_rules(mode="list", ru_direct=False), [
+            ("vpn", geosite + "ru-blocked"), ("vpn", "ext:ru-geoip.dat:ru-blocked"),
+            ("direct", "*")])
+        s = mkauto.apply_setting(dict(mkauto.DEFAULTS), "ru_direct", "off")
+        self.assertFalse(s["ru_direct"])
+        self.assertIsNotNone(refused(mkauto.apply_setting, dict(s), "ru_direct", "maybe"))
 
 
 class Hysteria2Xray(unittest.TestCase):

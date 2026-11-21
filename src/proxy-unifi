@@ -3312,7 +3312,7 @@ _build_auto() {
     ensure_keys
     auto_ensure_dirs
     if [ "$(py "$MKAUTO" settings --root "$AUTO_DIR" 2>/dev/null \
-            | py -c 'import json,sys;print(json.load(sys.stdin)["ru_blocked"])')" = "True" ] \
+            | py -c 'import json,sys;s=json.load(sys.stdin);print(s["ru_blocked"] or s["ru_direct"])')" = "True" ] \
             && { [ ! -s "$BIN_DIR/ru-geosite.dat" ] || [ ! -s "$BIN_DIR/ru-geoip.dat" ]; }; then
         info "downloading the ru-blocked lists (first use) ..."
         auto_geo_fetch || fatal "could not download the ru-blocked lists"
@@ -3537,9 +3537,9 @@ auto_rule() {
     txn_commit
 }
 
-# proxy auto set mode list|all | order DE,PL,.. | ru_blocked on|off
+# proxy auto set mode list|all | order DE,PL,.. | ru_blocked on|off | ru_direct on|off
 auto_set() {
-    case "${1:-}" in mode|order|ru_blocked|self_hosts) : ;; *) fatal "use: set mode|order|ru_blocked|self_hosts <value>" ;; esac
+    case "${1:-}" in mode|order|ru_blocked|ru_direct|self_hosts) : ;; *) fatal "use: set mode|order|ru_blocked|ru_direct|self_hosts <value>" ;; esac
     auto_ensure_dirs
     ensure_run_dir
     _new="$(py "$MKAUTO" settings --root "$AUTO_DIR" --set "$1=${2:-}" 2>&1)" || fatal "${_new#*error: }"
@@ -3679,6 +3679,7 @@ print("Auto mode:   %s" % ("ON" if d["auto_active"] else "off (engine: %s)" % d[
 print("Traffic:     %s" % ("only listed traffic uses VPN" if s.get("mode")=="list" else "everything uses VPN except the direct list"))
 print("Countries:   %s" % " -> ".join(s.get("order",[])))
 print("ru-blocked:  %s" % ("on" if s.get("ru_blocked") else "off"))
+print("RU direct:   %s" % ("on (Russian TV, banks, gov, VK, Yandex)" if s.get("ru_direct") else "off"))
 print("Active:      %s" % (h.get("active_label") or "-"))
 print()
 print("Sources:")

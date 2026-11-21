@@ -92,7 +92,7 @@ def action_command(a):
             raise ValueError("bad rule")
         return ["rule", a["action"], a["list"], _str(a, "value", 253)], ""
     if op == "set":
-        if a.get("key") not in ("mode", "order", "ru_blocked"):
+        if a.get("key") not in ("mode", "order", "ru_blocked", "ru_direct"):
             raise ValueError("bad setting")
         return ["set", a["key"], _str(a, "value", 400)], ""
     if op == "node":
@@ -301,7 +301,7 @@ th{color:var(--mut);font-weight:500}.big{font-size:18px;font-weight:600}.scroll{
 <div class="card"><h2>Режим</h2>
 <div class="row"><label><input type="radio" name="mode" value="list"> Через VPN только списки (остальное напрямую)</label></div>
 <div class="row"><label><input type="radio" name="mode" value="all"> Всё через VPN, кроме списка «напрямую»</label></div>
-<div class="row" style="margin-top:8px"><label><input type="checkbox" id="rub"> Готовый список «заблокировано в РФ» (только для первого режима)</label><button class="s" data-op="geo_update">Обновить список</button></div></div>
+<div class="row" style="margin-top:8px"><label><input type="checkbox" id="rub"> Готовый список «заблокировано в РФ» (только для первого режима)</label><button class="s" data-op="geo_update">Обновить список</button></div><div class="row" style="margin-top:8px"><label><input type="checkbox" id="rud"> Российские сервисы всегда напрямую (онлайн-кинотеатры, ТВ, банки, Госуслуги, ВК, Яндекс)</label></div></div>
 
 <div class="card"><h2>Порядок стран</h2><div class="mut" style="margin-bottom:8px">Перетащите или двигайте стрелками. Первая живая страна получает трафик; внутри страны — самый быстрый сервер (или закреплённый).</div>
 <div class="chips" id="order"></div>
@@ -334,7 +334,7 @@ const flag=cc=>cc&&cc.length==2?String.fromCodePoint(...[...cc].map(c=>0x1F1A5+c
 function render(){const h=S.health||{},st=S.settings||{};
  $('#active').textContent=h.killswitch?'Нет живых серверов — VPN-трафик остановлен':(h.active_label||'—');$('#active').className='big '+(h.killswitch?'bad':'');
  $('#sub').textContent=h.updated?('проверено '+new Date(h.updated*1000).toLocaleTimeString()):'';$('#enablebox').hidden=S.auto_active;
- document.querySelectorAll('input[name=mode]').forEach(r=>r.checked=r.value==st.mode);$('#rub').checked=!!st.ru_blocked;
+ document.querySelectorAll('input[name=mode]').forEach(r=>r.checked=r.value==st.mode);$('#rub').checked=!!st.ru_blocked;$('#rud').checked=!!st.ru_direct;
  if(!$('#order')._dirty){order=[...(st.order||[])];drawOrder()}
  const hb={};(h.nodes||[]).forEach(n=>hb[n.tag]=n);
  $('#nodes').innerHTML=S.nodes.map(n=>{const x=hb[n.tag]||{};let s;if(!n.usable)s='<span class="mut">'+esc(n.reason)+'</span>';else if(x.ok)s='<span class="ok">● '+x.rtt+' мс</span>';else if(x.last_probe)s='<span class="bad">● нет ответа</span>';else s='<span class="mut">проверка…</span>';
@@ -362,6 +362,7 @@ document.addEventListener('click',e=>{const t=e.target.closest('[data-op],[data-
  else if(d.cc){const v=prompt('Код страны (DE, PL, …), пусто — по флагу в имени');if(v!==null)act({op:'node',action:'country',id:d.cc,cc:v.trim().toUpperCase()})}});
 document.querySelectorAll('input[name=mode]').forEach(r=>r.onchange=()=>act({op:'set',key:'mode',value:r.value}));
 $('#rub').onchange=e=>act({op:'set',key:'ru_blocked',value:e.target.checked?'on':'off'});
+$('#rud').onchange=e=>act({op:'set',key:'ru_direct',value:e.target.checked?'on':'off'});
 $('#addccb').onclick=()=>{const v=$('#addcc').value.trim().toUpperCase();if(/^[A-Z]{2}$/.test(v)&&!order.includes(v)){order.push(v);$('#order')._dirty=true;drawOrder();$('#addcc').value=''}};
 $('#saveorder').onclick=()=>act({op:'set',key:'order',value:order.join(',')},'Порядок сохранён').then(()=>$('#order')._dirty=false);
 $('#addsub').onclick=()=>act({op:'add_sub',name:$('#sn').value.trim(),url:$('#su').value.trim(),ua:$('#sua').value.trim()},'Подписка добавлена').then(()=>{$('#su').value=''});

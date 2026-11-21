@@ -3717,7 +3717,7 @@ auto_panel_password() {
         systemctl disable --now "$PANEL_NAME" >/dev/null 2>&1 || true
         txn_commit; c_ylw "Panel turned off."; return 0
     fi
-    [ "${#_pw}" -ge 8 ] || fatal "use at least 8 characters"
+    [ "${#_pw}" -ge 4 ] || fatal "use at least 4 characters"
     printf '%s' "$_pw" | py "$PANEL" --hash-password | atomic_write "$PANEL_PASS_FILE" 600 \
         || fatal "could not store the panel password"
     write_auto_units || fatal "could not write the panel unit"
